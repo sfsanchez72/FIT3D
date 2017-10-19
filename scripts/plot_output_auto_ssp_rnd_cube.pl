@@ -1,0 +1,1 @@
+/home/sanchez/sda2/code/lyon/fitting_tool/user/bin/plot_output_auto_ssp_rnd_cube.pl

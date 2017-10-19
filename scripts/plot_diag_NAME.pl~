@@ -1,0 +1,229 @@
+#!/usr/bin/perl
+#
+# This programs creates a set of fits files
+# extracting the information from the line-fitting results.
+#
+
+
+use Statistics::OLS;
+use Math::Stat;
+use Math::Stat;
+use Math::Spline qw(spline linsearch binsearch);
+use Math::Derivative qw(Derivative2);
+
+use Math::Approx;
+
+
+use Astro::FITS::CFITSIO qw( :longnames :constants );
+use PDL;
+
+use PDL::Fit::Polynomial; 
+use PDL::Filter::Linear;
+use PGPLOT;  # Load PGPLOT module
+use PDL::Fit::Gaussian;
+use PDL::Graphics::LUT;
+use Carp;
+
+$ENV{PGPLOT_FOREGROUND} = "black";
+$ENV{PGPLOT_BACKGROUND} = "white";
+
+require "/home/sanchez/sda1/perl/MY/my.pl";
+
+if ($#ARGV<3) {
+    print "USE: plot_diag_NAME.pl OBJECTNAME DEV XC YC\n"; 
+    exit;
+}
+
+$name=$ARGV[0];
+$dev=$ARGV[1];
+$XC=$ARGV[2];
+$YC=$ARGV[3];
+$table="rainbow4";
+$reverse=0;
+$bright=0.51;
+$contrast=0.51;
+if ($#ARGV==7) {
+    $bright=$ARGV[4];
+    $contrast=$ARGV[5];
+    $table=$ARGV[6];
+    $reverse=$ARGV[7];
+}
+
+$scale=1;
+if ($#ARGV==8) {
+    $bright=$ARGV[4];
+    $contrast=$ARGV[5];
+    $table=$ARGV[6];
+    $reverse=$ARGV[7];
+    $scale=$ARGV[8];
+}
+
+# CLEAN.FIT.HII.2MASXJ1319+53_FLUX.slice
+
+
+
+$ENV{'PGPLOT_ENVOPT'}="V";
+pgbegin(0,$dev,1,1);  # Open plot device
+
+
+
+($pl,$pr,$pg,$pb)=lut_data($table,$reverse);
+$nc=$pl->getdim(0);
+for ($j=0;$j<$nc;$j++) {
+    $l[$j] = $pl->slice($j)->sclr;
+    $r[$j] = $pr->slice($j)->sclr;
+    $g[$j] = $pg->slice($j)->sclr;
+    $b[$j] = $pb->slice($j)->sclr;
+}
+
+
+$r[0]=1;  
+$g[0]=1;  
+$b[0]=1;  
+
+pgscir(50,100);
+pgctab(\@l,\@r,\@g,\@b,$nc,$bright,$contrast);
+
+
+pgscf(2.0);             # Set character font
+pgslw(2);             # Set line width
+pgsch(1.2);           # Set character height
+pgsvp(0.1,0.75,0.15,0.98);
+pgswin(-1.2,0.6,-1.2,1.2);
+pgscir(50,80);
+pglabel("log([NII]\\gl6583/H\\ga)","log([OIII]\\gl5007/H\\gb)","");
+pgsci(1);
+$sym=17;
+pgsci(1);
+pgsch(2.1);
+$file="FIT.HII.".$name."_FLUX.slice";
+$output="diag.".$name.".out";
+#print "NO.BTP $name ";
+$n=0;
+$n0=0;
+open(FH,"<$file");
+open(OUT,">$output");
+print OUT "# (1) ID\n";
+print OUT "# (2) TYPE\n";
+print OUT "#T 0 NO.BTP\n";
+print OUT "#T 1 SF\n";
+print OUT "#T 2 SF/AGN\n";
+print OUT "#T 3 AGN\n";
+$nALL=0;
+$nGOOD=0;
+while($line=<FH>) {
+    chop($line);
+    if ($line !~ "#") {
+	@data=split(" ",$line);
+	$ID=$data[0];
+	$a_ID[$n]=$ID;
+	$a_TYPE[$n]=0;
+	$x=$data[1];
+	$y=$data[2];
+	$OIII=$data[13];
+	$e_OIII=$data[14];
+	$Hb=$data[17];
+	$e_Hb=$data[18];
+	$NII=$data[5];
+	$e_NII=$data[6];
+	$Ha=$data[3];
+	$e_Ha=$data[4];
+	$dist=sqrt(abs(($x-$XC)**2+($y-$YC)**2));
+	$dist=$dist/$scale;
+	$color=51+int($dist);
+	if ($Hb>0) {
+	    $rat_Ha_Hb=$Ha/$Hb;
+	} else {
+	    $rat_Ha_Hb=-1;
+	}
+#	print "$dist $color $dist $i,$XC $j,$YC\n";
+#	pgsci($color);
+	pgsch(1.5+$dist/10);
+	$nALL++;
+	if (($OIII>0)&&($NII>0)&&($Hb>0)&&($Ha>0)&&($e_Hb<$Hb/3)&&($e_Ha<$Ha/3)&&($e_OIII<$OIII/3)&&($e_NII<$NII/3)&&($rat_Ha_Hb>2.7)) {
+	    $nGOOD++;
+	    $X=log10($NII/$Ha);
+	    $Y=log10($OIII/$Hb);
+	    $eX=$e_NII/$Ha+$NII*$e_Ha/($Ha**2);
+	    $eY=$e_OIII/$Hb+$OIII*$e_Hb/($Hb**2);
+
+#	    pgpoint(1,[$X],[$Y],$sym);
+#	    pgsci(4);
+	    pgsci(1);
+	    pgerrb(1,1,[$X],[$Y],[$eX],0.5);
+	    pgerrb(3,1,[$X],[$Y],[$eX],0.5);
+	    pgerrb(2,1,[$X],[$Y],[$eY],0.5);
+	    pgerrb(4,1,[$X],[$Y],[$eY],0.5);
+
+	    pgsci($color);
+	    pgpoint(1,[$X],[$Y],17);
+	    pgsci(1);
+	    pgpoint(1,[$X],[$Y],22);
+	    $cut_y3=0.61/($X-0.05)+1.3;
+	    $cut_y4=0.61/($X-0.47)+1.19;
+	    if ($Y<=$cut_y3) {
+		$a_TYPE[$n]=1;
+	    } else {
+		if ($Y<=$cut_y4) {
+		    $a_TYPE[$n]=2;
+		} else {
+		    $a_TYPE[$n]=3;
+		}
+	    }
+	} else {
+	    
+	    $n0++;
+#	    print "$ID ";
+	}
+	pgsci(1);
+	printf OUT ("%3d %2d\n",$ID,$a_TYPE[$n]); 
+	$n++;	
+    }
+}
+#print "\n";
+print OUT "# NO.BTP $name $n0 $n\n";
+close(OUT);
+pgsci(1);
+pgsch(1.2);
+for ($i=0;$i<200;$i++) {
+    $cut_x[$i]=-2+0.02*$i;
+    $cut_y[$i]=-0.7+0.2-3.67*$cut_x[$i];
+    $cut_y2[$i]=-1.7+0.5-3.67*$cut_x[$i];
+
+    $cut_y3[$i]=0.61/($cut_x[$i]-0.05)+1.3;
+    $cut_y4[$i]=0.61/($cut_x[$i]-0.47)+1.19;
+    if ($cut_y3[$i]>1.1) {
+	$cut_y3[$i]=-10;
+    }
+    if ($cut_y4[$i]>1.1) {
+	$cut_y4[$i]=-10;
+    }
+    
+}
+pgsls(1);
+pgslw(3);
+pgsci(2);
+pgline($#cut_x,\@cut_x,\@cut_y3);
+pgsls(2);
+pgslw(3);
+pgsci(4);
+pgline($#cut_x,\@cut_x,\@cut_y4);
+
+pgsch(1.7);
+pgsls(1);
+pgsci(1);
+pgptxt(-1.1,1,0,0,"$name");
+pgsch(1.2);
+pgsls(1);
+pgsci(1);
+pgbox("ZYHBCNST",0,0,"ZYDBCNST",0,0);
+pgclos();
+pgend();
+
+
+
+
+
+exit;
+
+

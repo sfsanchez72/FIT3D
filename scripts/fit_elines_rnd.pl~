@@ -1,0 +1,2525 @@
+#!/usr/bin/perl
+#
+#
+#
+
+#use PGPLOT;
+
+use Statistics::OLS;
+use Math::FFT;
+use Math::Stat;
+use Math::Spline qw(spline linsearch binsearch);
+use Math::Derivative qw(Derivative2);
+use Math::Approx;
+use Astro::FITS::CFITSIO qw( :longnames :constants );
+use PDL;
+use PDL::Fit::Polynomial; 
+use PDL::Filter::Linear;
+use PGPLOT;  # Load PGPLOT module
+use PDL::Fit::Gaussian;
+#use forks;
+use  PDL::Fit::Linfit;
+
+$sec_ini=print_time();
+
+require("/home/sanchez/sda1/perl/MY/my.pl");
+
+
+
+
+#    srand(time);
+
+if ($#ARGV<4) {
+    print "USE: fit_elines_rnd.pl SPECTRUM.TXT CONFIG MASK_LIST W_MIN W_MAX [REDEFINE_MAX] [N_MC=50] [N_LOOPS=15]  [PLOT] [SCALE_INI=0.15]\n";
+    exit;
+}
+
+$spec_file=$ARGV[0];
+$config=$ARGV[1];
+$mask_list=$ARGV[2];
+$w_min=$ARGV[3];
+$w_max=$ARGV[4];
+$def=0;
+if ($#ARGV==5) {
+    $def=$ARGV[5];
+}
+
+$n_loops=20;
+$n_mc=50;
+
+$plot=0;
+if ($#ARGV==6) {
+    $def=$ARGV[5];
+    $n_mc=$ARGV[6];
+}
+
+if ($#ARGV==7) {
+    $def=$ARGV[5];
+    $n_mc=$ARGV[6];
+    $n_loops=$ARGV[7];
+}
+
+if ($#ARGV==8) {
+    $def=$ARGV[5];
+    $n_mc=$ARGV[6];
+    $n_loops=$ARGV[7];
+    $plot=$ARGV[8];
+}
+
+$scale_ini=0.15;
+if ($#ARGV==9) {
+    $def=$ARGV[5];
+    $n_mc=$ARGV[6];
+    $n_loops=$ARGV[7];
+    $plot=$ARGV[8];
+    $scale_init=$ARGV[9];
+}
+
+##################################################
+# READING INPUTS
+##################################################
+
+#
+# Reading MASK LIST
+#
+if ($mask_list eq "none") {
+    $nmask=0;
+} else {
+    open(FH,"<$mask_list");
+    while($line=<FH>) {
+	chop($line);
+	@data=split(" ",$line);
+	$start_mask[$nmask]=$data[0];
+	$end_mask[$nmask]=$data[1];
+	$nmask++;
+    }
+    close(FH);
+}
+
+print "$nmask regions to mask\n";
+
+#
+# READING FILE!
+#
+
+$nw=0;
+$y_min=10000;
+$y_max=-10000;
+open(FH,"<$spec_file");
+open(OUT,">fit_spectra.input");
+while ($line=<FH>) {
+    chop($line);
+    @data=split(" ",$line);
+    if ($line !~ "#") {
+	
+	if ($#data==3) {
+	    $e_flux[$n]=(abs($data[3]));
+	    $flux[$n]=$data[2];
+	    $wave[$n]=$data[1];
+	} 
+	if ($#data==2) {
+	    $flux[$n]=$data[2];
+	    $wave[$n]=$data[1];
+	    $e_flux[$n]=0.2*sqrt(abs($flux[$n]));   
+#$pdl_e_flux=sqrt(abs($pdl_flux+$stats[1]));
+	} 
+	if ($#data==1) {
+	    $flux[$n]=$data[1];
+	    $wave[$n]=$data[0];
+	    $e_flux[$n]=sqrt(abs($flux[$n]));
+	}
+	
+	if ($flux[$n]>$y_max) {
+	    $y_max=$flux[$n];
+	}
+	if ($flux[$n]<$y_min) {
+	    $y_min=$flux[$n];
+	}
+
+	$masked[$n]=1;
+	if ($flux[$n_unc]==0) {
+	    $masked[$n]=0;
+	}
+
+	$w_test=$wave[$n];
+	for ($j=0;$j<$nmask;$j++) {
+	    if (($w_test>$start_mask[$j])&&($w_test<$end_mask[$j])) {
+		$masked[$n]=0;	    
+	    }
+	}
+    
+	if (($wave[$n]>$w_min)&&($wave[$n]<$w_max)) {
+	    print OUT "$n $wave[$n] $flux[$n]\n";
+	    $n++;
+	}
+    }
+}
+close(OUT);
+close(FH);
+
+#print "WAVE = $n $wave[$n-1]\n";
+
+$pdl_masked=pdl(@masked);
+$pdl_flux=pdl(@flux);
+$pdl_wave=pdl(@wave);
+@stats=stats($pdl_flux);    
+#
+$pdl_e_flux=0.5*sqrt(abs($pdl_flux+$stats[1]));
+#
+$pdl_e_flux=pdl(@e_flux);
+@stats_e=stats($pdl_e_flux);
+$pdl_e_flux=0.5*$pdl_e_flux+0.5*$stats_e[2];
+#$pdl_e_flux=0.1*ones($n+1);
+#print "$pdl_e_flux\n $pdl_e_flux_tmp\n";
+
+$pdl_model=zeroes($n);
+$pdl_model_cont=zeroes($n);
+#
+# Reading CONFIG!
+#
+
+open(CNF,"<$config");
+$cnf=<CNF>; chop($cnf);
+my $n_free_par=0;
+($junk,$n_mod,$chi_goal,$d_chi_goal)=split(" ",$cnf);
+for ($ii=0;$ii<$n_mod;$ii++) {
+    $cnf=<CNF>; chop($cnf);
+    $type[$ii]=$cnf;
+    for ($j=0;$j<9;$j++) {
+	$cnf=<CNF>; chop($cnf);
+	@data=split(" ",$cnf);
+	$a[$ii][$j]=$data[0];
+	$ia[$ii][$j]=$data[1];
+	$ea[$ii][$jj]=0;
+	$a0[$ii][$j]=$data[2];
+	$a1[$ii][$j]=$data[3];
+	$link[$ii][$j]=$data[4];
+	$n_free_par=$n_free_par+$ia[$ii][$j];
+    }
+
+    if ($def==1) {
+	if ($type[$ii] eq "eline") {
+	    $a1_max=1.2*$y_max*($a[$ii][2]*((2*3.1416)**0.5));
+	    if ($a1[$ii][1]>$a1_max) {
+		$a1[$ii][1]=$a1_max;
+	    }
+	}
+	if ($type[$ii] eq "poly1d") {
+	    if ($a0[$ii][0]<$y_min) {
+		$a0[$ii][0]=$y_min;
+	    }
+	}
+    }
+}
+close(CNF);
+print "$n_mod models to fit\n";
+print "$n_free_par free parameters\n";
+#<stdin>;
+
+
+$chi_sq_now=1e12;
+$chi_sq_start=$chi_sq_now;
+my @a_out_now;
+my @a_results;
+
+my $nnk=0;
+
+my @a_out_tmp;
+my $i_ter=0;
+
+ srand(time);
+
+@a_out_now=copy_a($n_mod,\@a);
+
+$break=0;
+my $i_loops;
+while (($i_ter<$n_loops)&&($break==0)) {
+    my $chi_iter=$chi_sq_now;
+
+    $chi_single=0;
+    if ($n_free_par>0) {
+	(@a_out_now,$pdl_mod_out)=fit_elines_grad_rnd_new($pdl_wave,$pdl_flux,$pdl_e_flux,$n_mod,$chi_goal,$d_chi_goal,\@type,\@a_out_now,\@ia,\@a0,\@a1,\@link,$n_mc,$pdl_masked,$def,$scale_ini,4);
+
+    } else {
+	(@a_out_now,$pdl_mod_out)=fix_elines_grad_rnd_new($pdl_wave,$pdl_flux,$pdl_e_flux,$n_mod,$chi_goal,$d_chi_goal,\@type,\@a_out_now,\@ia,\@a0,\@a1,\@link,$n_mc,$pdl_masked,$def,$scale_ini,4);
+    }
+
+    if (($chi_sq_now<$chi_iter)||($n_free_par==0)) {
+
+############################################################
+# Close to a result, narrow the range
+	for ($i=0;$i<$n_mod;$i++) {
+	    for ($j=0;$j<9;$j++) {
+		if ($type[$i] eq "eline") {
+		    if ($ia[$i][$j]==1) {
+			if ($link[$i][$j]==-1) {  
+			    my $delta_now=abs($a1[$i][$j]-$a0[$i][$j])/(2);
+			    my $a0_tmp=$a0[$i][$j];
+			    my $a1_tmp=$a1[$i][$j];
+			    if ($j!=3) {
+				$a0_tmp=$a_out_now[$i][$j]-$delta_now;
+				$a1_tmp=$a_out_now[$i][$j]+$delta_now;
+			    } else {
+				$a0_tmp=$a_out_now[$i][$j]-0.5*$delta_now;
+				$a1_tmp=$a_out_now[$i][$j]+0.5*$delta_now;
+			    }
+			    if ($a0_tmp<$a0[$i][$j]) {
+				$a0_tmp=$a0[$i][$j];
+			    }
+			    if ($a1_tmp>$a1[$i][$j]) {
+				$a1_tmp=$a1[$i][$j];
+			    }
+			    $a0[$i][$j]=$a0_tmp;
+			    $a1[$i][$j]=$a1_tmp;
+			}
+		    }
+		}
+	    }
+	}
+
+######################################
+
+	@a_out_tmp=copy_a($n_mod,\@a_out_now);
+	@a_results=copy_a_results($n_mod,$nnk,\@a_out_now,\@a_results);    
+	$nnk++;
+	$i_ter++;
+    } else {
+	my $rnd_a=random(10);
+
+	@a_out_now=copy_a($n_mod,\@a_out_now);
+	$i_loops++;
+	if ($i_loops>5*$n_loops) {
+	    $break=1;
+	}
+#	$i_ter--;
+#	
+    }
+}
+
+my $out_ps_now="junk";
+my $title="";
+$pdl_res=$pdl_flux-$pdl_model;
+plot_results($plot,$pdl_wave,pdl($pdl_flux,$pdl_model,$pdl_res),$out_ps_now,$title);
+my $out_file_now="fit_elines_rnd.out";
+print_out_results($pdl_wave,pdl($pdl_flux,$pdl_model,$pdl_res),$out_file_now);
+
+#plot_test();
+print "----------------------------------------\n";
+@a_final=mean_a_results($n_mod,$nnk,\@a_results);
+print_a_final($n_mod,\@a_final,\@type,$chi_sq_now);
+$out_fit_spectra="out.fit_spectra";
+print_a_final_file($n_mod,\@a_final,\@type,$chi_sq_now,$out_fit_spectra);
+$out_config="out_config.fit_spectra";
+print_config_file($n_mod,$chi_goal,$d_chi_goal,\@a_final,\@type,\@ia,\@a0,\@a1,\@link,$out_config);
+
+
+
+
+$sec_end=print_time();
+
+$sec_total=$sec_end-$sec_ini;
+print "# SECONDS = $sec_total\n";
+
+exit;
+
+
+sub print_time {
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+    print "# TIME $sec $min $hour $mday $mon $year $wday $yday $isdst\n";
+    print LOG "# TIME $sec $min $hour $mday $mon $year $wday $yday $isdst\n";
+    my $sec_now=$min*60+$sec;
+    return $sec_now;
+}
+
+sub fit_elines_rnd() {
+    my $pdl_wave=$_[0];
+    my $pdl_flux=$_[1];
+    my $pdl_e_flux=$_[2];
+    my $n_mod=$_[3];
+    my $chi_goal=$_[4];
+    my $d_chi_goal=$_[5];
+    my $junk=$_[6];
+    my @type=@$junk;
+    my $junk=$_[7];
+    my @a=@$junk;
+    my $junk=$_[8];
+    my @ia=@$junk;
+    my $junk=$_[9];
+    my @a0=@$junk;
+    my $junk=$_[10];
+    my @a1=@$junk;
+    my $junk=$_[11];
+    my @link=@$junk;
+    my $n_rnd=$_[12];
+    my $pdl_masked=$_[13];
+    my $def=$_[14];
+    my $SCALE_INI=$_[15];
+    my @a_out;    
+#    my $SCALE_INI=3;
+    my $SCALE=$SCALE_INI;
+#    print "N.MOD = $n_mod, N.MC=$n_mc\n";
+
+    my @dims=$pdl_flux->dims;
+    if ($#dims==0) {
+	$nx=$dims[0];
+	$ny=1;
+    }
+
+    if ($#dims==1) {
+	$nx=$dims[0];
+	$ny=$dims[1];
+    }
+#    print "$nx,$ny\n";
+#    my $pdl_model=zeroes($nx,$ny);
+#    my $pdl_masked=ones($nx);
+
+    my $i;
+    #
+    #
+
+    # First Guess
+    my $n_points=sum($pdl_masked);
+    my $pdl_model_0=zeroes($nx);
+    my $pdl_model_cont_0=zeroes($nx);
+    for ($i=0;$i<$n_mod;$i++) {
+	my $pdl_tmp=create_single_model($pdl_wave,$i,\@type,\@a);
+	$pdl_model_0=$pdl_model_0+$pdl_tmp;
+    }
+    $pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a);
+
+    my $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+    my $chi_sq=sum($pdl_chi_now);
+    $chi_sq=($chi_sq/($n_points-$n_mod-1))**0.5;
+#    print "CHI_sq [GUESS]=$chi_sq\n";  
+	$chi_sq_ini=$chi_sq;
+	@a_out=copy_a($n_mod,\@a);
+
+
+
+
+    #############################
+    # TEST OUTPUT!
+    #
+    open(OUT,">test_fit_elines_rnd.spec");
+    for ($i=0;$i<$nx;$i++) {
+	my $w=$pdl_wave->at($i);
+	my $f=$pdl_flux->at($i);
+	my $f_mod=$pdl_model_0->at($i)*($pdl_masked->at($i));
+	my $f_res=$f-$f_mod;
+	my $f_cont=$pdl_model_cont_0->at($i);
+	print OUT "$w $f $f_mod $f_red $f_cont\n";
+    }
+    close(OUT);
+    $call="plot_out_fit_mod.pl test_fit_elines_rnd.spec 1/xs 0 2.5e4 6450 6800 &";
+    system($call);
+#    print "###################################\n";
+#    <stdin>;
+    #
+    # TEST OUTOUT
+    ###############################
+
+    my $i,$j,$ii;
+    my @a_now;
+
+#    srand(time);
+	$pdl_rnd=random($n_mod*9*$n_mc);
+
+    for ($ii=0;$ii<$n_mc;$ii++) {
+	for ($i=0;$i<$n_mod;$i++) {
+	    for ($j=0;$j<9;$j++) {
+		$rnd=$pdl_rnd->at(($j+(9*$i))*$ii);
+		if ($ia[$i][$j]==1) {
+		    if ($link[$i][$j]==-1) {
+			$a_now[$i][$j]=$a0[$i][$j]+($a1[$i][$j]-$a0[$i][$j])*$rnd;	
+		    } else {
+			$k=$link[$i][$j]-1;
+			$method=$a1[$i][$j];
+			if ($method==0) {
+			    $a_now[$i][$j]=$a_now[$k][$j]+$a0[$i][$j];
+			} else {
+			    $a_now[$i][$j]=$a_now[$k][$j]*$a0[$i][$j];
+			}			    
+		    }
+		} else {
+		    $a_now[$i][$j]=$a[$i][$j];
+		}	    
+	    }
+	}
+
+    # MC test
+    $pdl_model_0=zeroes($nx);
+    $pdl_model_cont_0=zeroes($nx);
+    for ($i=0;$i<$n_mod;$i++) {
+	my $pdl_tmp=create_single_model($pdl_wave,$i,\@type,\@a_now);
+	$pdl_model_0=$pdl_model_0+$pdl_tmp;
+    }
+    $pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a_now);
+
+    my $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+    my $chi_sq=sum($pdl_chi_now);
+    $chi_sq=($chi_sq/($n_points-$n_mod-1))**0.5;
+	if ($chi_sq<$chi_sq_ini) {
+	    @a_out=copy_a($n_mod,\@a_now);
+	    $chi_sq_ini=$chi_sq;
+
+
+    #############################
+    # TEST OUTPUT!
+    #
+    open(OUT,">test_fit_elines_rnd.spec");
+    for ($i=0;$i<$nx;$i++) {
+	my $w=$pdl_wave->at($i);
+	my $f=$pdl_flux->at($i);
+		my $f_mod=$pdl_model_0->at($i)*($pdl_masked->at($i));
+	my $f_res=$f-$f_mod;
+	my $f_cont=$pdl_model_cont_0->at($i);
+	print OUT "$w $f $f_mod $f_red $f_cont\n";
+    }
+    close(OUT);
+#    print "iter= $ii/$n_mc  CHI_sq=$chi_sq / $chi_sq_ini SCALE = $SCALE\n";	    
+#	    $call="plot_out_fit_mod.pl test_fit_elines_rnd.spec 1/xs 0 2.5e4 6300 7000 ";
+    $call="plot_out_fit_mod.pl test_fit_elines_rnd.spec 1/xs 0 2.5e4 6450 6800 &";
+    system($call);
+    #
+    # TEST OUTOUT
+	    ###############################
+
+
+	    my $iii;
+	    for ($iii=0;$iii<$n_mod-1;$iii++) {
+		if (($type[$iii] eq "eline") and ($link[$iii][1]==-1)) {
+		    $a0[$iii][1]=$a_out[$iii][1]/(1+1/$SCALE);
+		    $a1[$iii][1]=$a_out[$iii][1]*(1+$SCALE);
+		}
+	    }
+
+
+	    $SCALE=0.75*$SCALE;
+	    if ($SCALE>0.001) {
+		$ii=0;
+	    } else {
+		$ii=$n_mc;
+	    }
+
+
+
+
+
+
+
+
+	} else {
+
+	#    $SCALE=1.1*$SCALE;
+
+	}
+#else {	    
+#	    if (($def==1)&&($chi_sq>2*$chi_sq_ini)) {
+#	    if ($def==3) {
+#
+#		}
+#	    }
+#	}
+
+	   
+    }
+    $chi_sq_now=$chi_sq_ini;
+
+
+
+
+
+    return @a_out;
+}
+
+
+
+
+sub get_initial_guess() {
+    my $pdl_wave=$_[0];
+    my $pdl_flux=$_[1];
+    my $i_now=$_[2];
+    my $junk=$_[3];
+    my @type=@$junk;
+    my $junk=$_[4];
+    my @a=@$junk;
+    my @dims=$pdl_wave->dims();
+    my $nx=$dims[0];
+    my $i=0;
+#    my $pdl_out=zeroes($nx);
+    my $j=0;
+    my $guess;
+
+    if ($type[$i_now] eq "eline") {
+	$guess=$a[$i_now][1];
+	$min_delta_wave=1e12;
+	for ($i=0;$i<$nx;$i++) {
+	    my $w=$pdl_wave->at($i);	    
+	    my $speed_of_light=299792.458;
+	    my $factor=(1+$a[$i_now][3]/$speed_of_light+$a[$i_now][5]);
+	    my $delta_wave=abs($w-$a[$i_now][0]*$factor);
+	    if ($min_delta_wave>$delta_wave) {
+		$min_delta_wave=$delta_wave;
+		$guess=$pdl_flux->at($i);
+		$guess=$guess*($a[$i_now][2]*((2*3.1416)**0.5));
+	    }
+	}
+    }
+
+    if ($type[$i_now] eq "poly1d") {
+	$guess=$a[$i_now][0];
+	@stats=stats($pdl_flux);
+	$guess=$stats[2];
+    }
+    return $guess;
+}
+
+
+
+sub fit_elines_grad_rnd() {
+    my $pdl_wave=$_[0];
+    my $pdl_flux=$_[1];
+    my $pdl_e_flux=$_[2];
+    my $n_mod=$_[3];
+    my $chi_goal=$_[4];
+    my $d_chi_goal=$_[5];
+    my $junk=$_[6];
+    my @type=@$junk;
+    my $junk=$_[7];
+    my @a=@$junk;
+    my $junk=$_[8];
+    my @ia=@$junk;
+    my $junk=$_[9];
+    my @a0=@$junk;
+    my $junk=$_[10];
+    my @a1=@$junk;
+    my $junk=$_[11];
+    my @link=@$junk;
+    my $n_rnd=$_[12];
+    my $pdl_masked=$_[13];
+    my $def=$_[14];
+    my $SCALE_INI=$_[15];
+    my @a_out;    
+    my $SCALE=$SCALE_INI;
+
+
+    my @dims=$pdl_flux->dims;
+    if ($#dims==0) {
+	$nx=$dims[0];
+	$ny=1;
+    }
+
+    if ($#dims==1) {
+	$nx=$dims[0];
+	$ny=$dims[1];
+    }
+
+    my $i;
+
+
+    # First Guess
+    my $n_points=sum($pdl_masked);
+    my $pdl_model_0=zeroes($nx);
+    my $pdl_model_cont_0=zeroes($nx);
+    for ($i=0;$i<$n_mod;$i++) {
+	my $pdl_tmp=create_single_model($pdl_wave,$i,\@type,\@a);
+	$pdl_model_0=$pdl_model_0+$pdl_tmp;
+    }
+    $pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a);
+    my $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+    my $chi_sq=sum($pdl_chi_now);
+    $chi_sq=($chi_sq/($n_points-$n_mod-1))**0.5;
+    $chi_sq_ini=$chi_sq;
+    @a_out=copy_a($n_mod,\@a);
+
+
+    my $i,$j,$ii;
+    my @a_now;
+
+
+    # We start the fitting loop!
+    $pdl_rnd=grandom($n_mod*9*$n_mc);
+    $pdl_rnd_lin=random($n_mod*9*$n_mc);
+    my $ii=0;
+    while ($ii<$n_mc) {
+
+	#
+	# We change slighly the parameters
+	#
+	for ($i=0;$i<$n_mod;$i++) {
+	    for ($j=0;$j<9;$j++) {
+		$rnd=$pdl_rnd->at(($j+(9*$i))*$ii);
+		$rnd_lin=$pdl_rnd_lin->at(($j+(9*$i))*$ii);
+		if ($ia[$i][$j]==1) {
+		    if ($link[$i][$j]==-1) {
+			if ($type[$i] eq "eline") {
+			    if ($j==3) {
+				$a_now[$i][$j]=$a_out[$i][$j]+$SCALE*$rnd*($a1[$i][$j]-$a0[$i][$j])/5;
+			    } else {
+				$a_now[$i][$j]=$a_out[$i][$j]+$SCALE*$a_out[$i][$j]*$rnd;
+			    }
+
+			} else {
+			    $a_now[$i][$j]=$a_out[$i][$j]+$SCALE*$a_out[$i][$j]*$rnd*0.001;
+			}
+			
+			if ($a_now[$i][$j]<$a0[$i][$j]) {
+			    $a_now[$i][$j]=$a0[$i][$j];
+			}
+			if ($a_now[$i][$j]>$a1[$i][$j]) {
+			    $a_now[$i][$j]=$a1[$i][$j];
+			}
+			
+
+		    } else {
+			$k=$link[$i][$j]-1;
+			$method=$a1[$i][$j];
+			if ($method==0) {
+			    $a_now[$i][$j]=$a_now[$k][$j]+$a0[$i][$j];
+			} else {
+			    $a_now[$i][$j]=$a_now[$k][$j]*$a0[$i][$j];
+			}			    
+		    }
+		} else {
+		    $a_now[$i][$j]=$a_out[$i][$j];
+		}	    
+	    }
+#	    print "$type[$i] $a_now[$i][0]\n";
+	}
+
+	# MC test
+	$pdl_model_0=zeroes($nx);
+	$pdl_model_cont_0=zeroes($nx);
+	for ($i=0;$i<$n_mod;$i++) {
+	    my $pdl_tmp=create_single_model($pdl_wave,$i,\@type,\@a_now);
+	    $pdl_model_0=$pdl_model_0+$pdl_tmp;
+	}
+	$pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a_now);
+	my $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+	my $chi_sq=sum($pdl_chi_now);
+	$chi_sq=($chi_sq/($n_points-$n_mod-1))**0.5;
+	if ($chi_sq<$chi_sq_ini) {
+	    @a_out=copy_a($n_mod,\@a_now);
+	    $chi_sq_ini=$chi_sq;
+	    $pdl_model=$pdl_model_0;
+	    $pdl_model_cont=$pdl_model_cont_0;
+#	    $ii=0;
+	} else {
+#	    if ((abs($chi_sq-$chi_sq_ini)<0.01*abs($chi_sq_ini))||(abs($chi_sq-$chi_sq_ini)<$d_chi_sq_goal)||($chi_sq_ini<$chi_sq_goal)) {
+	    if ((abs($chi_sq-$chi_sq_ini)<$d_chi_sq_goal)||($chi_sq_ini<$chi_sq_goal)) {
+		$ii=$n_mc;
+	    }
+	}
+	$ii++;
+    }
+    $chi_sq_now=$chi_sq_ini;
+    return @a_out;
+}
+
+# 1111111111111111111111111111111111
+sub fix_elines_grad_rnd_new() {
+    my $pdl_wave=$_[0];
+    my $pdl_flux=$_[1];
+    my $pdl_e_flux=$_[2];
+    my $n_mod=$_[3];
+    my $chi_goal=$_[4];
+    my $d_chi_goal=$_[5];
+    my $junk=$_[6];
+    my @type=@$junk;
+    my $junk=$_[7];
+    my @a=@$junk;
+    my $junk=$_[8];
+    my @ia=@$junk;
+    my $junk=$_[9];
+    my @a0=@$junk;
+    my $junk=$_[10];
+    my @a1=@$junk;
+    my $junk=$_[11];
+    my @link=@$junk;
+    my $n_rnd=$_[12];
+    my $pdl_masked=$_[13];
+    my $def=$_[14];
+    my $SCALE_INI=$_[15];
+    my @a_out;    
+    my $SCALE=$SCALE_INI;
+
+    my $NX;
+    my @dims=$pdl_flux->dims;
+    if ($#dims==0) {
+	$NX=$dims[0];
+#	$NY=1;
+    }
+
+ 
+
+    my $i;
+
+
+    # First Guess
+    my $n_points=sum($pdl_masked);
+    my $pdl_model_0=zeroes($NX);
+    my $pdl_model_cont_0=zeroes($NX);
+    for ($i=0;$i<$n_mod;$i++) {
+	my $pdl_tmp=create_single_model($pdl_wave,$i,\@type,\@a);
+	$pdl_model_0=$pdl_model_0+$pdl_tmp;
+    }
+    $pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a);
+    my $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+    my $chi_sq=sum($pdl_chi_now);
+    $chi_sq=3*($chi_sq/($n_points-$n_mod-1))**0.5;
+    $chi_sq_ini=$chi_sq;
+    @a_out=copy_a($n_mod,\@a);
+
+    $chi_sq_now=$chi_sq_ini;
+    $pdl_model=$pdl_model_0;
+    return (@a_out,$pdl_model);
+#    return @a_out;
+}
+
+
+# 000000000000000000000000000000000000000000
+sub fit_elines_grad_rnd_new() {
+    my $pdl_wave=$_[0];
+    my $pdl_flux=$_[1];
+    my $pdl_e_flux=$_[2];
+    my $n_mod=$_[3];
+    my $chi_goal=$_[4];
+    my $d_chi_goal=$_[5];
+    my $junk=$_[6];
+    my @type=@$junk;
+    my $junk=$_[7];
+    my @a=@$junk;
+    my $junk=$_[8];
+    my @ia=@$junk;
+    my $junk=$_[9];
+    my @a0=@$junk;
+    my $junk=$_[10];
+    my @a1=@$junk;
+    my $junk=$_[11];
+    my @link=@$junk;
+    my $n_rnd=$_[12];
+    my $pdl_masked=$_[13];
+    my $def=$_[14];
+    my $SCALE_INI=$_[15];
+    my @a_out;    
+    my $SCALE=$SCALE_INI;
+
+    my $NX;
+    my @dims=$pdl_flux->dims;
+    if ($#dims==0) {
+	$NX=$dims[0];
+#	$NY=1;
+    }
+
+ 
+
+    my $i;
+
+
+    # First Guess
+    my $n_points=sum($pdl_masked);
+    my $pdl_model_0=zeroes($NX);
+    my $pdl_model_cont_0=zeroes($NX);
+    for ($i=0;$i<$n_mod;$i++) {
+	my $pdl_tmp=create_single_model($pdl_wave,$i,\@type,\@a);
+	$pdl_model_0=$pdl_model_0+$pdl_tmp;
+    }
+    $pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a);
+    my $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+    my $chi_sq=sum($pdl_chi_now);
+    $chi_sq=3*($chi_sq/($n_points-$n_mod-1))**0.5;
+    $chi_sq_ini=$chi_sq;
+    @a_out=copy_a($n_mod,\@a);
+
+
+    my $i,$j,$ii;
+    my @a_now;
+
+
+    $pdl_rnd=grandom($n_mod*9*$n_mc);
+    $pdl_rnd_lin=0.8+0.4*random($n_mod*9*$n_mc);
+
+
+
+
+
+#
+# 1st we derive the redshift!
+#
+    
+    #
+    # Do we have to fit the redshift?
+    #
+    my $fit_red=0;
+    for ($i=0;$i<$n_mod;$i++) {
+	if ($ia[$i][$j]==1) {
+	    $fit_red=1;
+	}
+    }
+
+    my @chi_r;
+    my @red_r;
+    $new_mc=int($n_mc/2);
+#    $new_mc=$new_mc*$fit_red;
+
+    for ($ii=0;$ii<$new_mc;$ii++) {
+	# We change slighly the parameters
+	#
+	for ($i=0;$i<$n_mod;$i++) {
+	    for ($j=0;$j<9;$j++) {
+		$rnd=$pdl_rnd->at(($j+(9*$i))*$ii);
+		$rnd_lin=$pdl_rnd_lin->at(($j+(9*$i))*$ii);
+		if ($ia[$i][$j]==1) {
+		    if ($link[$i][$j]==-1) {
+			if ($type[$i] ne "poly1d") {
+			    if ($j==3) {
+				$a_now[$i][$j]=$a0[$i][$j]+$rnd_lin*($a1[$i][$j]-$a0[$i][$j])*$ii/$new_mc;
+			    } else {
+				$a_now[$i][$j]=$a_out[$i][$j];#+$SCALE*$a_out[$i][$j]*$rnd;
+			    }
+			} else {
+			    $a_now[$i][$j]=$a_out[$i][$j]+$SCALE*$a_out[$i][$j]*$rnd;
+			}
+
+			if ($a_now[$i][$j]<$a0[$i][$j]) {
+			    $a_now[$i][$j]=$a0[$i][$j];
+			}
+			if ($a_now[$i][$j]>$a1[$i][$j]) {
+			    $a_now[$i][$j]=$a1[$i][$j];
+			}
+
+		    } else {
+			my $k=$link[$i][$j]-1;
+			my $method=$a1[$i][$j];
+			if ($method==0) {
+			    $a_now[$i][$j]=$a_now[$k][$j]+$a0[$i][$j];
+			} else {
+			    $a_now[$i][$j]=$a_now[$k][$j]*$a0[$i][$j];
+			}			    
+		    }
+		} else {
+		    $a_now[$i][$j]=$a_out[$i][$j];
+		}	    
+	    }
+	}
+
+	my $n_mod_free=0;
+	my $i1,$j1;
+	my $pdl_model_n;
+	for ($i1=0;$i1<$n_mod;$i1++) {
+	    if ($type[$i1] eq "eline") {
+		if ($ia[$i1][1]==1) {
+		    if ($link[$i1][1]==-1) {
+			my $pdl_tmp=create_single_model_one($pdl_wave,$i1,\@type,\@a_now);
+			if ($n_mod_free==0) {
+			    $pdl_model_n=$pdl_tmp;
+			} else {
+			    $pdl_model_n=$pdl_model_n->glue(1,$pdl_tmp);
+			}
+			$n_mod_free++;
+		    } else {
+			my $pdl_tmp=create_single_model_one($pdl_wave,$i1,\@type,\@a_now);
+			my $ii=$link[$i1][1]-1;
+			my $t=$pdl_model_n->slice(":,$ii");
+			$pdl_tmp=$pdl_tmp*$a0[$i1][1];		
+			$t .= $t +$pdl_tmp;		   
+		    }
+		}
+	    }
+	    if ($type[$i1] eq "poly1d") {	    
+		for ($j=0;$j<9;$j++) {
+		    if ($ia[$i1][$j]==1) {
+			my $pdl_tmp=create_single_model_poly($pdl_wave,$j);
+			$pdl_model_n=$pdl_model_n->glue(1,$pdl_tmp);
+			$n_mod_free++;
+		    }
+		}
+	    }
+	}
+
+
+	my $pdl_grandom=grandom($NX);
+	my $pdl_flux_fit=$pdl_flux-$cont+$pdl_grandom*$pdl_e_flux;
+#	($pdl_model_0, $coeffs_0) = linfit1d($pdl_flux_fit,$pdl_model_n,{Weights=>1/$pdl_e_flux});
+
+#	($pdl_model_0, $coeffs_0) = linfit1d($pdl_flux_fit,$pdl_model_n,{Weights=>1/$pdl_e_flux});
+#	print "N.MOD=$n_mod,$n_mod_free\n";
+#	print "N.MOD.FREE= $n_mod_free\n";
+    @dim_n=$pdl_model_n->dims();
+#	if ($n_mod_free>0) {
+	    if ($dim_n[1]>1) {
+		($pdl_model_0, $coeffs_0) = linfit1d($pdl_flux_fit,$pdl_model_n);#,{Weights=>1/$pdl_e_flux});#,{Weights=>1/$p
+	    } else {
+		my $pdl_rat=$pdl_flux_fit/$pdl_model_n;
+		$pdl_rat->inplace->setnantobad();
+		$pdl_rat->inplace->setbadtoval(0);
+		my @stats=stats($pdl_rat);
+		$coeffs_0=ones(1);
+		$pdl_model_0=$stats[2]*$pdl_model_n;
+		$coeffs_0=$stats[2]*$coeffs_0;
+	    }
+#	}
+
+
+	$pdl_model_0=$pdl_model_0+$cont;
+#	print "$pdl_model_0\n";
+	my $n_mod_free=0;
+	for ($i1=0;$i1<$n_mod;$i1++) {
+	    if ($type[$i1] eq "eline") {
+		if ($ia[$i1][1]==1) {
+		    if ($link[$i1][1]==-1) {
+			$a_now[$i1][1]=$coeffs_0->at($n_mod_free);
+
+			if ($a_now[$i1][1]<$a0[$i1][1]) {
+			    $a_now[$i1][1]=$a0[$i1][1];
+			}
+			if ($a_now[$i1][1]>$a1[$i1][1]) {
+			    $a_now[$i1][1]=$a1[$i1][1];
+			}
+
+
+			$n_mod_free++;
+		    } else {
+			my $k=$link[$i1][1]-1;
+			my $method=$a1[$i1][1];
+			if ($method==0) {
+			    $a_now[$i1][1]=$a_now[$k][1]+$a0[$i1][1];
+			} else {
+			    $a_now[$i1][1]=$a_now[$k][1]*$a0[$i1][1];
+			}			    
+		    }
+		}
+	    }
+	    if ($type[$i1] eq "poly1d") {
+		for ($j=0;$j<9;$j++) {
+		    if ($ia[$i1][$j]==1) {
+			my $val=$coeffs_0->at($n_mod_free);
+			$a_now[$i1][$j]=$val;
+			$n_mod_free++;
+		    }
+		}
+	    }
+	}
+
+
+	my $pdl_model_0=zeroes($NX);
+	my $pdl_model_cont_0=zeroes($NX);
+	for ($i=0;$i<$n_mod;$i++) {
+	    my $pdl_tmp=create_single_model($pdl_wave,$i,\@type,\@a_now);
+	    $pdl_model_0=$pdl_model_0+$pdl_tmp;
+	}
+	$pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a_now);
+	
+#	plot_results(1,$pdl_wave,pdl($pdl_flux,$pdl_model,$pdl_model_0,$pdl_e_flux),"junk","redshift");	
+
+	my $pdl_a_now=pdl(@a_now);
+
+
+
+
+
+
+
+
+
+
+	
+	my $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+	my $chi_sq=sum($pdl_chi_now);
+	$chi_sq=($chi_sq/($n_points-$n_mod-1))**0.5;
+
+
+#	print "$ii/$new_mc $a_now[0][3] ($chi_sq<=$chi_sq_ini)\n";
+	if ($chi_sq<=$chi_sq_ini) {
+	    @a_out=copy_a($n_mod,\@a_now);
+#	    @a_out=@a_now;
+	    $chi_sq_ini=$chi_sq;
+	    $pdl_model=$pdl_model_0;
+	    $pdl_model_cont=$pdl_model_cont_0;
+	}
+#	my $time2=get_seconds();
+#	my $d_time2=$time2-$time1;
+#	print "$time1, $time2, $d_time2, $max_time, $ii,$n_mc\n";
+#	if ($d_time2>$max_time) {
+#	    $ii=$n_mc;
+#	}
+
+#    plot_results(1,$pdl_wave,pdl($pdl_flux,$pdl_model,$pdl_model_0,$pdl_e_flux),"junk","redshift");
+
+#	print "$ii/$new_mc $chi_sq<$chi_sq_ini $n_points,$n_mod\n";#$pdl_e_flux\n";
+
+#	for ($h=0;$h<$NX;$h++) {
+#	    my $val=$pdl_e_flux->at($h);
+#	    if ($val==0) {
+#		print "$val\n";
+#	    }
+#	}
+
+
+   }
+
+#    print_a_val($n_mod,\@a0,\@a1,\@test);
+
+    $ii=0;
+
+#    $chi_sq_ini=1e12;
+
+    @a_now=copy_a($n_mod,\@a_out);
+
+
+    
+#
+# 2nd we derive the sigma
+#
+    $new_mc=int($n_mc/3);
+    for ($ii=0;$ii<$new_mc;$ii++) {
+	#
+	# We change slighly the parameters
+	#
+	for ($i=0;$i<$n_mod;$i++) {
+	    for ($j=0;$j<9;$j++) {
+		$rnd=$pdl_rnd->at(($j+(9*$i))*$ii);
+		$rnd_lin=$pdl_rnd_lin->at(($j+(9*$i))*$ii);
+		if ($ia[$i][$j]==1) {
+		    if ($link[$i][$j]==-1) {
+			if ($type[$i] ne "poly1d") {
+			    if ($j==2) {
+				$a_now[$i][$j]=$a0[$i][$j]+$rnd_lin*($a1[$i][$j]-$a0[$i][$j])*$ii/$new_mc;#$a_out[$i][$j];#+$SCALE*$a_out[$i][$j]*$rnd;
+			    } else {
+				$a_now[$i][$j]=$a_out[$i][$j];
+			    }
+			} else {
+			    $a_now[$i][$j]=$a_out[$i][$j]+$SCALE*$a_out[$i][$j]*$rnd;
+			}
+
+			if ($a_now[$i][$j]<$a0[$i][$j]) {
+			    $a_now[$i][$j]=$a0[$i][$j];
+			}
+			if ($a_now[$i][$j]>$a1[$i][$j]) {
+			    $a_now[$i][$j]=$a1[$i][$j];
+			}
+
+		    } else {
+			my $k=$link[$i][$j]-1;
+			my $method=$a1[$i][$j];
+			if ($method==0) {
+			    $a_now[$i][$j]=$a_now[$k][$j]+$a0[$i][$j];
+			} else {
+			    $a_now[$i][$j]=$a_now[$k][$j]*$a0[$i][$j];
+			}			    
+		    }
+		} else {
+		    $a_now[$i][$j]=$a_out[$i][$j];
+		}	    
+	    }
+	}
+
+	my $n_mod_free=0;
+	my $i1,$j1;
+	my $pdl_model_n;
+	for ($i1=0;$i1<$n_mod;$i1++) {
+	    if ($type[$i1] eq "eline") {
+		if ($ia[$i1][1]==1) {
+		    if ($link[$i1][1]==-1) {
+			my $pdl_tmp=create_single_model_one($pdl_wave,$i1,\@type,\@a_now);
+			if ($n_mod_free==0) {
+			    $pdl_model_n=$pdl_tmp;
+			} else {
+			    $pdl_model_n=$pdl_model_n->glue(1,$pdl_tmp);
+			}
+			$n_mod_free++;
+		    } else {
+			my $pdl_tmp=create_single_model_one($pdl_wave,$i1,\@type,\@a_now);
+			my $ii=$link[$i1][1]-1;
+			my $t=$pdl_model_n->slice(":,$ii");
+			$pdl_tmp=$pdl_tmp*$a0[$i1][1];		
+			$t .= $t +$pdl_tmp;		   
+		    }
+		}
+	    }
+	    if ($type[$i1] eq "poly1d") {	    
+		for ($j=0;$j<9;$j++) {
+		    if ($ia[$i1][$j]==1) {
+			my $pdl_tmp=create_single_model_poly($pdl_wave,$j);
+			$pdl_model_n=$pdl_model_n->glue(1,$pdl_tmp);
+			$n_mod_free++;
+		    }
+		}
+	    }
+	}
+
+
+	my $pdl_grandom=grandom($NX);
+	my $pdl_flux_fit=$pdl_flux-$cont+$pdl_grandom*$pdl_e_flux;
+
+    @dim_n=$pdl_model_n->dims();
+    if ($dim_n[1]>1) {
+	($pdl_model_0, $coeffs_0) = linfit1d($pdl_flux_fit,$pdl_model_n);#,{Weights=>1/$pdl_e_flux});#,{Weights=>1/$pdl_e_flux});
+    } else {
+	my $pdl_rat=$pdl_flux_fit/$pdl_model_n;
+	$pdl_rat->inplace->setnantobad();
+	$pdl_rat->inplace->setbadtoval(0);
+	my @stats=stats($pdl_rat);
+	$coeffs_0=ones(1);
+	$pdl_model_0=$stats[2]*$pdl_model_n;
+	$coeffs_0=$stats[2]*$coeffs_0;
+    }
+
+
+	$pdl_model_0=$pdl_model_0+$cont;
+#	print "$pdl_model_0\n";
+	my $n_mod_free=0;
+	for ($i1=0;$i1<$n_mod;$i1++) {
+	    if ($type[$i1] eq "eline") {
+		if ($ia[$i1][1]==1) {
+		    if ($link[$i1][1]==-1) {
+			$a_now[$i1][1]=$coeffs_0->at($n_mod_free);
+			$n_mod_free++;
+		    } else {
+			my $k=$link[$i1][1]-1;
+			my $method=$a1[$i1][1];
+			if ($method==0) {
+			    $a_now[$i1][1]=$a_now[$k][1]+$a0[$i1][1];
+			} else {
+			    $a_now[$i1][1]=$a_now[$k][1]*$a0[$i1][1];
+			}			    
+		    }
+		}
+	    }
+	    if ($type[$i1] eq "poly1d") {
+		for ($j=0;$j<9;$j++) {
+		    if ($ia[$i1][$j]==1) {
+			my $val=$coeffs_0->at($n_mod_free);
+			$a_now[$i1][$j]=$val;
+			$n_mod_free++;
+		    }
+		}
+	    }
+	}
+	
+	
+	$pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a_now);
+
+	my $pdl_a_now=pdl(@a_now);
+
+
+	my $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+	my $chi_sq=sum($pdl_chi_now);
+	$chi_sq=($chi_sq/($n_points-$n_mod-1))**0.5;
+#	print "$ii/$new_mc $a_now[0][4] ($chi_sq<=$chi_sq_ini)\n";
+	if ($chi_sq<=$chi_sq_ini) {
+	    @a_out=copy_a($n_mod,\@a_now);
+#	    @a_out=@a_now;
+	    $chi_sq_ini=$chi_sq;
+	    $pdl_model=$pdl_model_0;
+	    $pdl_model_cont=$pdl_model_cont_0;
+	}
+    }
+
+
+    $ii=0;
+
+#    $chi_sq_ini=1e12;
+
+    @a_now=copy_a($n_mod,\@a_out);
+
+
+
+    # We start the fitting loop!
+
+    my $ii=0;
+    my $SCALE_IN=$SCALE;
+#    $ii=$n_mc;
+    $new_mc=0;
+    while ($ii<$new_mc) {
+
+	#
+	# We change slighly the parameters
+	#
+	for ($i=0;$i<$n_mod;$i++) {
+	    for ($j=0;$j<9;$j++) {
+		$rnd=$pdl_rnd->at(($j+(9*$i))*$ii);
+		$rnd_lin=$pdl_rnd_lin->at(($j+(9*$i))*$ii);
+		if ($ia[$i][$j]==1) {
+		    if ($link[$i][$j]==-1) {
+			my $A1=$a1[$i][$j];
+			my $A0=$a0[$i][$j];
+			if ($a1[$i][$j]>1.3*$a_out[$i][$j]) {
+			    $A1=1.3*$a_out[$i][$j];
+			}
+			if ($a0[$i][$j]<0.7*$a_out[$i][$j]) {
+			    $A0=0.7*$a_out[$i][$j];
+			}
+
+#			print "$A1,$A0\n";
+
+			if ($type[$i] eq "eline") {
+			    if ($j==3) {
+				$a_now[$i][$j]=$a_out[$i][$j]+$SCALE*$rnd*($A1-$A0)/(5*$new_mc);
+			    } else {
+				$a_now[$i][$j]=$a_out[$i][$j]+$SCALE*$a_out[$i][$j]*$rnd;
+			    }
+
+			if ($a_now[$i][$j]<$A0) {
+			    $a_now[$i][$j]=$A0;
+			}
+			if ($a_now[$i][$j]>$A1) {
+			    $a_now[$i][$j]=$A1;
+			}
+
+
+
+			} else {
+# No variation!
+			    $a_now[$i][$j]=$a_out[$i][$j];#+$SCALE*$a_out[$i][$j]*$rnd*0.0001;
+			}
+			
+			
+
+		    } else {
+			$k=$link[$i][$j]-1;
+			$method=$a1[$i][$j];
+			if ($method==0) {
+			    $a_now[$i][$j]=$a_now[$k][$j]+$a0[$i][$j];
+			} else {
+			    $a_now[$i][$j]=$a_now[$k][$j]*$a0[$i][$j];
+			}			    
+		    }
+		} else {
+		    $a_now[$i][$j]=$a_out[$i][$j];
+		}	    
+	    }
+#	    print "$type[$i] $a_now[$i][0]\n";
+	}
+
+	# MC test
+	$pdl_model_0=zeroes($NX);
+	$pdl_model_cont_0=zeroes($NX);
+	for ($i=0;$i<$n_mod;$i++) {
+	    my $pdl_tmp=create_single_model($pdl_wave,$i,\@type,\@a_now);
+	    $pdl_model_0=$pdl_model_0+$pdl_tmp;
+	}
+	$pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a_now);
+	my $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+	my $chi_sq=sum($pdl_chi_now);
+	$chi_sq=($chi_sq/($n_points-$n_mod-1))**0.5;
+	if ($chi_sq<$chi_sq_ini) {
+	    @a_out=copy_a($n_mod,\@a_now);
+	    $chi_sq_ini=$chi_sq;
+	    $pdl_model=$pdl_model_0;
+	    $pdl_model_cont=$pdl_model_cont_0;
+	    $SCALE=$SCALE*0.99;
+	    if ($SCALE<0.1*$SCALE_IN) {
+		$SCALE=$SCALE_IN*0.1;
+	    }
+	} else {
+	    $SCALE=$SCALE_IN;
+
+	    if ((abs($chi_sq-$chi_sq_ini)<$d_chi_sq_goal)||($chi_sq_ini<$chi_sq_goal)) {
+		$ii=$n_mc;
+	    }
+	}
+	$ii++;
+    }
+    $chi_sq_now=$chi_sq_ini;
+#   @a_now_lin=copy_a($n_mod,\@a_out);
+
+    return (@a_out,$pdl_model);
+}
+
+
+sub fit_elines_grad_rnd_new_2() {
+    my $pdl_wave=$_[0];
+    my $pdl_flux=$_[1];
+    my $pdl_e_flux=$_[2];
+    my $n_mod=$_[3];
+    my $chi_goal=$_[4];
+    my $d_chi_goal=$_[5];
+    my $junk=$_[6];
+    my @type=@$junk;
+    my $junk=$_[7];
+    my @a=@$junk;
+    my $junk=$_[8];
+    my @ia=@$junk;
+    my $junk=$_[9];
+    my @a0=@$junk;
+    my $junk=$_[10];
+    my @a1=@$junk;
+    my $junk=$_[11];
+    my @link=@$junk;
+    my $n_rnd=$_[12];
+    my $pdl_masked=$_[13];
+    my $def=$_[14];
+    my $SCALE_INI=$_[15];
+    my @a_out;    
+    my $SCALE=$SCALE_INI;
+
+
+    my @dims=$pdl_flux->dims;
+    if ($#dims==0) {
+	$nx=$dims[0];
+	$ny=1;
+    }
+
+    if ($#dims==1) {
+	$nx=$dims[0];
+	$ny=$dims[1];
+    }
+
+    my $i;
+
+
+    # First Guess
+    my $n_points=sum($pdl_masked);
+    my $pdl_model_0=zeroes($nx);
+    my $pdl_model_cont_0=zeroes($nx);
+    for ($i=0;$i<$n_mod;$i++) {
+	my $pdl_tmp=create_single_model($pdl_wave,$i,\@type,\@a);
+	$pdl_model_0=$pdl_model_0+$pdl_tmp;
+    }
+    $pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a);
+    my $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+    my $chi_sq=sum($pdl_chi_now);
+    $chi_sq=($chi_sq/($n_points-$n_mod-1))**0.5;
+    $chi_sq_ini=$chi_sq;
+    @a_out=copy_a($n_mod,\@a);
+
+
+    my $i,$j,$ii;
+    my @a_now;
+
+
+    $pdl_rnd=grandom($n_mod*9*$n_mc);
+    $pdl_rnd_lin=random($n_mod*9*$n_mc);
+    $new_mc=int($n_mc/3);
+#
+# 1st we derive the redshift!
+#
+    for ($ii=0;$ii<$new_mc;$ii++) {
+	# We change slighly the parameters
+	#
+	for ($i=0;$i<$n_mod;$i++) {
+	    for ($j=0;$j<9;$j++) {
+		$rnd=$pdl_rnd->at(($j+(9*$i))*$ii);
+		$rnd_lin=$pdl_rnd_lin->at(($j+(9*$i))*$ii);
+		if ($ia[$i][$j]==1) {
+		    if ($link[$i][$j]==-1) {
+			if ($type[$i] ne "poly1d") {
+			    if ($j==3) {
+				$a_now[$i][$j]=$a0[$i][$j]+($a1[$i][$j]-$a0[$i][$j])*$ii/$new_mc;
+			    } else {
+				$a_now[$i][$j]=$a_out[$i][$j];#+$SCALE*$a_out[$i][$j]*$rnd;
+			    }
+			} else {
+			    $a_now[$i][$j]=$a_out[$i][$j]+$SCALE*$a_out[$i][$j]*$rnd;
+			}
+
+			if ($a_now[$i][$j]<$a0[$i][$j]) {
+			    $a_now[$i][$j]=$a0[$i][$j];
+			}
+			if ($a_now[$i][$j]>$a1[$i][$j]) {
+			    $a_now[$i][$j]=$a1[$i][$j];
+			}
+
+		    } else {
+			my $k=$link[$i][$j]-1;
+			my $method=$a1[$i][$j];
+			if ($method==0) {
+			    $a_now[$i][$j]=$a_now[$k][$j]+$a0[$i][$j];
+			} else {
+			    $a_now[$i][$j]=$a_now[$k][$j]*$a0[$i][$j];
+			}			    
+		    }
+		} else {
+		    $a_now[$i][$j]=$a_out[$i][$j];
+		}	    
+	    }
+	}
+
+	my $n_mod_free=0;
+	my $i1,$j1;
+	my $pdl_model_n;
+	for ($i1=0;$i1<$n_mod;$i1++) {
+	    if ($type[$i1] eq "eline") {
+		if ($ia[$i1][1]==1) {
+		    if ($link[$i1][1]==-1) {
+			my $pdl_tmp=create_single_model_one($pdl_wave,$i1,\@type,\@a_now);
+			if ($n_mod_free==0) {
+			    $pdl_model_n=$pdl_tmp;
+			} else {
+			    $pdl_model_n=$pdl_model_n->glue(1,$pdl_tmp);
+			}
+			$n_mod_free++;
+		    } else {
+			my $pdl_tmp=create_single_model_one($pdl_wave,$i1,\@type,\@a_now);
+			my $ii=$link[$i1][1]-1;
+			my $t=$pdl_model_n->slice(":,$ii");
+			$pdl_tmp=$pdl_tmp*$a0[$i1][1];		
+			$t .= $t +$pdl_tmp;		   
+		    }
+		}
+	    }
+	    if ($type[$i1] eq "poly1d") {	    
+		for ($j=0;$j<9;$j++) {
+		    if ($ia[$i1][$j]==1) {
+			my $pdl_tmp=create_single_model_poly($pdl_wave,$j);
+			$pdl_model_n=$pdl_model_n->glue(1,$pdl_tmp);
+			$n_mod_free++;
+		    }
+		}
+	    }
+	}
+
+
+	my $pdl_grandom=grandom($nx);
+	my $pdl_flux_fit=$pdl_flux-$cont;#+$pdl_grandom*$pdl_e_flux;
+#	($pdl_model_0, $coeffs_0) = linfit1d($pdl_flux_fit,$pdl_model_n,{Weights=>1/$pdl_e_flux});
+
+    @dim_n=$pdl_model_n->dims();
+    if ($dim_n[1]>1) {
+	($pdl_model_0, $coeffs_0) = linfit1d($pdl_flux_fit,$pdl_model_n);#,{Weights=>1/$pdl_e_flux});#,{Weights=>1/$pdl_e_flux});
+    } else {
+	my $pdl_rat=$pdl_flux_fit/$pdl_model_n;
+	$pdl_rat->inplace->setnantobad();
+	$pdl_rat->inplace->setbadtoval(0);
+	my @stats=stats($pdl_rat);
+	$coeffs_0=ones(1);
+	$pdl_model_0=$stats[2]*$pdl_model_n;
+	$coeffs_0=$stats[2]*$coeffs_0;
+    }
+
+
+	$pdl_model_0=$pdl_model_0+$cont;
+#	print "$pdl_model_0\n";
+	my $n_mod_free=0;
+	for ($i1=0;$i1<$n_mod;$i1++) {
+	    if ($type[$i1] eq "eline") {
+		if ($ia[$i1][1]==1) {
+		    if ($link[$i1][1]==-1) {
+			$a_now[$i1][1]=$coeffs_0->at($n_mod_free);
+			$n_mod_free++;
+		    } else {
+			my $k=$link[$i1][1]-1;
+			my $method=$a1[$i1][1];
+			if ($method==0) {
+			    $a_now[$i1][1]=$a_now[$k][1]+$a0[$i1][1];
+			} else {
+			    $a_now[$i1][1]=$a_now[$k][1]*$a0[$i1][1];
+			}			    
+		    }
+		}
+	    }
+	    if ($type[$i1] eq "poly1d") {
+		for ($j=0;$j<9;$j++) {
+		    if ($ia[$i1][$j]==1) {
+			my $val=$coeffs_0->at($n_mod_free);
+			$a_now[$i1][$j]=$val;
+			$n_mod_free++;
+		    }
+		}
+	    }
+	}
+	
+	
+	$pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a_now);
+
+	my $pdl_a_now=pdl(@a_now);
+
+
+	my $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+	my $chi_sq=sum($pdl_chi_now);
+	$chi_sq=($chi_sq/($n_points-$n_mod-1))**0.5;
+#	print "$ii/$new_mc $a_now[0][3] ($chi_sq<=$chi_sq_ini)\n";
+	if ($chi_sq<=$chi_sq_ini) {
+	    @a_out=copy_a($n_mod,\@a_now);
+#	    @a_out=@a_now;
+	    $chi_sq_ini=$chi_sq;
+	    $pdl_model=$pdl_model_0;
+	    $pdl_model_cont=$pdl_model_cont_0;
+	}
+#	my $time2=get_seconds();
+#	my $d_time2=$time2-$time1;
+#	print "$time1, $time2, $d_time2, $max_time, $ii,$n_mc\n";
+#	if ($d_time2>$max_time) {
+#	    $ii=$n_mc;
+#	}
+    }
+
+
+    $ii=0;
+
+    $chi_sq_ini=1e12;
+
+    @a_now=copy_a($n_mod,\@a_out);
+
+#
+# 2nd we derive the sigma
+#
+    for ($ii=0;$ii<$new_mc;$ii++) {
+	#
+	# We change slighly the parameters
+	#
+	for ($i=0;$i<$n_mod;$i++) {
+	    for ($j=0;$j<9;$j++) {
+		$rnd=$pdl_rnd->at(($j+(9*$i))*$ii);
+		$rnd_lin=$pdl_rnd_lin->at(($j+(9*$i))*$ii);
+		if ($ia[$i][$j]==1) {
+		    if ($link[$i][$j]==-1) {
+			if ($type[$i] ne "poly1d") {
+			    if ($j==2) {
+				$a_now[$i][$j]=$a0[$i][$j]+($a1[$i][$j]-$a0[$i][$j])*$ii/$new_mc;#$a_out[$i][$j];#+$SCALE*$a_out[$i][$j]*$rnd;
+			    } else {
+				$a_now[$i][$j]=$a_out[$i][$j];
+			    }
+			} else {
+			    $a_now[$i][$j]=$a_out[$i][$j]+$SCALE*$a_out[$i][$j]*$rnd;
+			}
+
+			if ($a_now[$i][$j]<$a0[$i][$j]) {
+			    $a_now[$i][$j]=$a0[$i][$j];
+			}
+			if ($a_now[$i][$j]>$a1[$i][$j]) {
+			    $a_now[$i][$j]=$a1[$i][$j];
+			}
+
+		    } else {
+			my $k=$link[$i][$j]-1;
+			my $method=$a1[$i][$j];
+			if ($method==0) {
+			    $a_now[$i][$j]=$a_now[$k][$j]+$a0[$i][$j];
+			} else {
+			    $a_now[$i][$j]=$a_now[$k][$j]*$a0[$i][$j];
+			}			    
+		    }
+		} else {
+		    $a_now[$i][$j]=$a_out[$i][$j];
+		}	    
+	    }
+	}
+
+	my $n_mod_free=0;
+	my $i1,$j1;
+	my $pdl_model_n;
+	for ($i1=0;$i1<$n_mod;$i1++) {
+	    if ($type[$i1] eq "eline") {
+		if ($ia[$i1][1]==1) {
+		    if ($link[$i1][1]==-1) {
+			my $pdl_tmp=create_single_model_one($pdl_wave,$i1,\@type,\@a_now);
+			if ($n_mod_free==0) {
+			    $pdl_model_n=$pdl_tmp;
+			} else {
+			    $pdl_model_n=$pdl_model_n->glue(1,$pdl_tmp);
+			}
+			$n_mod_free++;
+		    } else {
+			my $pdl_tmp=create_single_model_one($pdl_wave,$i1,\@type,\@a_now);
+			my $ii=$link[$i1][1]-1;
+			my $t=$pdl_model_n->slice(":,$ii");
+			$pdl_tmp=$pdl_tmp*$a0[$i1][1];		
+			$t .= $t +$pdl_tmp;		   
+		    }
+		}
+	    }
+	    if ($type[$i1] eq "poly1d") {	    
+		for ($j=0;$j<9;$j++) {
+		    if ($ia[$i1][$j]==1) {
+			my $pdl_tmp=create_single_model_poly($pdl_wave,$j);
+			$pdl_model_n=$pdl_model_n->glue(1,$pdl_tmp);
+			$n_mod_free++;
+		    }
+		}
+	    }
+	}
+
+
+	my $pdl_grandom=grandom($nx);
+	my $pdl_flux_fit=$pdl_flux-$cont;#+$pdl_grandom*$pdl_e_flux;
+
+    @dim_n=$pdl_model_n->dims();
+    if ($dim_n[1]>1) {
+	($pdl_model_0, $coeffs_0) = linfit1d($pdl_flux_fit,$pdl_model_n);#,{Weights=>1/$pdl_e_flux});#,{Weights=>1/$pdl_e_flux});
+    } else {
+	my $pdl_rat=$pdl_flux_fit/$pdl_model_n;
+	$pdl_rat->inplace->setnantobad();
+	$pdl_rat->inplace->setbadtoval(0);
+	my @stats=stats($pdl_rat);
+	$coeffs_0=ones(1);
+	$pdl_model_0=$stats[2]*$pdl_model_n;
+	$coeffs_0=$stats[2]*$coeffs_0;
+    }
+
+
+	$pdl_model_0=$pdl_model_0+$cont;
+#	print "$pdl_model_0\n";
+	my $n_mod_free=0;
+	for ($i1=0;$i1<$n_mod;$i1++) {
+	    if ($type[$i1] eq "eline") {
+		if ($ia[$i1][1]==1) {
+		    if ($link[$i1][1]==-1) {
+			$a_now[$i1][1]=$coeffs_0->at($n_mod_free);
+			$n_mod_free++;
+		    } else {
+			my $k=$link[$i1][1]-1;
+			my $method=$a1[$i1][1];
+			if ($method==0) {
+			    $a_now[$i1][1]=$a_now[$k][1]+$a0[$i1][1];
+			} else {
+			    $a_now[$i1][1]=$a_now[$k][1]*$a0[$i1][1];
+			}			    
+		    }
+		}
+	    }
+	    if ($type[$i1] eq "poly1d") {
+		for ($j=0;$j<9;$j++) {
+		    if ($ia[$i1][$j]==1) {
+			my $val=$coeffs_0->at($n_mod_free);
+			$a_now[$i1][$j]=$val;
+			$n_mod_free++;
+		    }
+		}
+	    }
+	}
+	
+	
+	$pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a_now);
+
+	my $pdl_a_now=pdl(@a_now);
+
+
+	my $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+	my $chi_sq=sum($pdl_chi_now);
+	$chi_sq=($chi_sq/($n_points-$n_mod-1))**0.5;
+#	print "$ii/$new_mc $a_now[0][4] ($chi_sq<=$chi_sq_ini)\n";
+	if ($chi_sq<=$chi_sq_ini) {
+	    @a_out=copy_a($n_mod,\@a_now);
+#	    @a_out=@a_now;
+	    $chi_sq_ini=$chi_sq;
+	    $pdl_model=$pdl_model_0;
+	    $pdl_model_cont=$pdl_model_cont_0;
+	}
+    }
+
+
+    $ii=0;
+
+    $chi_sq_ini=1e12;
+
+    @a_now=copy_a($n_mod,\@a_out);
+
+
+
+    # We start the fitting loop!
+
+    my $ii=0;
+    my $SCALE_IN=$SCALE;
+#    $ii=$n_mc;
+    while ($ii<$new_mc) {
+
+	#
+	# We change slighly the parameters
+	#
+	for ($i=0;$i<$n_mod;$i++) {
+	    for ($j=0;$j<9;$j++) {
+		$rnd=$pdl_rnd->at(($j+(9*$i))*$ii);
+		$rnd_lin=$pdl_rnd_lin->at(($j+(9*$i))*$ii);
+		if ($ia[$i][$j]==1) {
+		    if ($link[$i][$j]==-1) {
+			if ($a1[$i][$j]>1.3*$a_out[$i][$j]) {
+			    $a1[$i][$j]=1.3*$a_out[$i][$j];
+			}
+			if ($a0[$i][$j]<0.7*$a_out[$i][$j]) {
+			    $a0[$i][$j]=0.7*$a_out[$i][$j];
+			}
+
+
+
+
+
+			if ($type[$i] eq "eline") {
+			    if ($j==3) {
+				$a_now[$i][$j]=$a_out[$i][$j]+$SCALE*$rnd*($a1[$i][$j]-$a0[$i][$j])/(2*$new_mc);
+			    } else {
+				$a_now[$i][$j]=$a_out[$i][$j]+$SCALE*$a_out[$i][$j]*$rnd;
+			    }
+
+			if ($a_now[$i][$j]<$a0[$i][$j]) {
+			    $a_now[$i][$j]=$a0[$i][$j];
+			}
+			if ($a_now[$i][$j]>$a1[$i][$j]) {
+			    $a_now[$i][$j]=$a1[$i][$j];
+			}
+
+
+
+			} else {
+# No variation!
+			    $a_now[$i][$j]=$a_out[$i][$j];#+$SCALE*$a_out[$i][$j]*$rnd*0.0001;
+			}
+			
+			
+
+		    } else {
+			$k=$link[$i][$j]-1;
+			$method=$a1[$i][$j];
+			if ($method==0) {
+			    $a_now[$i][$j]=$a_now[$k][$j]+$a0[$i][$j];
+			} else {
+			    $a_now[$i][$j]=$a_now[$k][$j]*$a0[$i][$j];
+			}			    
+		    }
+		} else {
+		    $a_now[$i][$j]=$a_out[$i][$j];
+		}	    
+	    }
+#	    print "$type[$i] $a_now[$i][0]\n";
+	}
+
+	# MC test
+	$pdl_model_0=zeroes($nx);
+	$pdl_model_cont_0=zeroes($nx);
+	for ($i=0;$i<$n_mod;$i++) {
+	    my $pdl_tmp=create_single_model($pdl_wave,$i,\@type,\@a_now);
+	    $pdl_model_0=$pdl_model_0+$pdl_tmp;
+	}
+	$pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a_now);
+	my $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+	my $chi_sq=sum($pdl_chi_now);
+	$chi_sq=($chi_sq/($n_points-$n_mod-1))**0.5;
+	if ($chi_sq<$chi_sq_ini) {
+	    @a_out=copy_a($n_mod,\@a_now);
+	    $chi_sq_ini=$chi_sq;
+	    $pdl_model=$pdl_model_0;
+	    $pdl_model_cont=$pdl_model_cont_0;
+	    $SCALE=$SCALE*0.99;
+	    if ($SCALE<0.1*$SCALE_IN) {
+		$SCALE=$SCALE_IN*0.1;
+	    }
+	} else {
+	    $SCALE=$SCALE_IN;
+
+	    if ((abs($chi_sq-$chi_sq_ini)<$d_chi_sq_goal)||($chi_sq_ini<$chi_sq_goal)) {
+		$ii=$n_mc;
+	    }
+	}
+	$ii++;
+    }
+    $chi_sq_now=$chi_sq_ini;
+    return @a_out;
+}
+
+
+sub fit_elines_grad_rnd_NEW() {
+    my $pdl_wave=$_[0];
+    my $pdl_flux=$_[1];
+    my $pdl_e_flux=$_[2];
+    my $n_mod=$_[3];
+    my $chi_goal=$_[4];
+    my $d_chi_goal=$_[5];
+    my $junk=$_[6];
+    my @type=@$junk;
+    my $junk=$_[7];
+    my @a=@$junk;
+    my $junk=$_[8];
+    my @ia=@$junk;
+    my $junk=$_[9];
+    my @a0=@$junk;
+    my $junk=$_[10];
+    my @a1=@$junk;
+    my $junk=$_[11];
+    my @link=@$junk;
+    my $n_rnd=$_[12];
+    my $pdl_masked=$_[13];
+    my $def=$_[14];
+    my $SCALE_INI=$_[15];
+    my @a_out;    
+    my $SCALE=$SCALE_INI;
+
+
+    my @dims=$pdl_flux->dims;
+    if ($#dims==0) {
+	$nx=$dims[0];
+	$ny=1;
+    }
+
+    if ($#dims==1) {
+	$nx=$dims[0];
+	$ny=$dims[1];
+    }
+
+    my $i;
+
+
+    # First Guess
+    my $n_points=sum($pdl_masked);
+    my $pdl_model_0=zeroes($nx);
+    my $pdl_model_cont_0=zeroes($nx);
+    for ($i=0;$i<$n_mod;$i++) {
+	my $pdl_tmp=create_single_model($pdl_wave,$i,\@type,\@a);
+	$pdl_model_0=$pdl_model_0+$pdl_tmp;
+    }
+    $pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a);
+    my $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+    my $chi_sq=sum($pdl_chi_now);
+    $chi_sq=($chi_sq/($n_points-$n_mod-1))**0.5;
+    $chi_sq_ini=$chi_sq;
+    @a_out=copy_a($n_mod,\@a);
+
+
+    my $i,$j,$ii;
+    my @a_now;
+
+    my $pdl_rnd=grandom($n_mod*9*$n_mc);
+    my $pdl_rnd_lin=random($n_mod*9*$n_mc);
+
+    # We start the fitting loop!
+    my $ii=0;
+    while ($ii<$n_mc) {
+	my $pdl_chi_now;
+	my $chi_sq;
+	my $II;
+	my @childs;
+	my $pid;
+
+
+	my $junk=fit_elines_rnd_single($pdl_wave,$pdl_flux,$pdl_e_flux,$n_mod,$chi_goal,$d_chi_goal,\@type,\@a_out,\@ia,\@a0,\@a1,\@link,$n_mc,$pdl_masked,$def,$scale_ini,$pdl_rnd,$pdl_rnd_lin,$ii);
+	my @a_now=@$junk;
+	$chi_sq=$a_now[$n_mod][0];
+
+#	$chi_sq=$chi_single;
+
+#	print "$ii,$n_mc,$chi_sq,$chi_sq_ini\n";
+
+	
+	if ($chi_sq<$chi_sq_ini) {
+	    @a_out=copy_a($n_mod,\@a_now);
+	    $chi_sq_ini=$chi_sq;
+	    $pdl_model=$pdl_model_0;
+	    $pdl_model_cont=$pdl_model_cont_0;
+	} else {
+	    if ((abs($chi_sq-$chi_sq_ini)<$d_chi_sq_goal)||($chi_sq_ini<$chi_sq_goal)) {
+		$ii=$n_mc;
+	    }
+	}
+
+	$ii++;
+    }
+    $chi_sq_now=$chi_sq_ini;
+    return @a_out;
+}
+
+
+
+sub fit_elines_grad_rnd_fork() {
+    my $pdl_wave=$_[0];
+    my $pdl_flux=$_[1];
+    my $pdl_e_flux=$_[2];
+    my $n_mod=$_[3];
+    my $chi_goal=$_[4];
+    my $d_chi_goal=$_[5];
+    my $junk=$_[6];
+    my @type=@$junk;
+    my $junk=$_[7];
+    my @a=@$junk;
+    my $junk=$_[8];
+    my @ia=@$junk;
+    my $junk=$_[9];
+    my @a0=@$junk;
+    my $junk=$_[10];
+    my @a1=@$junk;
+    my $junk=$_[11];
+    my @link=@$junk;
+    my $n_rnd=$_[12];
+    my $pdl_masked=$_[13];
+    my $def=$_[14];
+    my $SCALE_INI=$_[15];
+    my $NC=$_[16];
+    my @a_out;    
+    my $SCALE=$SCALE_INI;
+
+    my @a_fork;
+    
+    my $i; 
+
+
+    my @dims=$pdl_flux->dims;
+    if ($#dims==0) {
+	$nx=$dims[0];
+	$ny=1;
+    }
+
+    if ($#dims==1) {
+	$nx=$dims[0];
+	$ny=$dims[1];
+    }
+
+    my $i;
+
+
+    # First Guess
+    my $n_points=sum($pdl_masked);
+    my $pdl_model_0=zeroes($nx);
+    my $pdl_model_cont_0=zeroes($nx);
+    for ($i=0;$i<$n_mod;$i++) {
+	my $pdl_tmp=create_single_model($pdl_wave,$i,\@type,\@a);
+	$pdl_model_0=$pdl_model_0+$pdl_tmp;
+    }
+    $pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a);
+    my $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+    my $chi_sq=sum($pdl_chi_now);
+    $chi_sq=($chi_sq/($n_points-$n_mod-1))**0.5;
+    $chi_sq_ini=$chi_sq;
+    @a_out=copy_a($n_mod,\@a);
+
+
+    my $i,$j,$ii;
+    my @a_now;
+
+    my $pdl_rnd=grandom($n_mod*9*$n_mc);
+    my $pdl_rnd_lin=random($n_mod*9*$n_mc);
+
+    # We start the fitting loop!
+    my $ii=0;
+    my @a_now_final;
+    my @a_now_single;
+
+    while ($ii<$n_mc) {
+	my $pdl_chi_now;
+	my $chi_sq;
+	my $II;
+	my @childs;
+	my $pid;
+
+# $forks[$i] = async { return sum($i,$sum); };
+
+	for ($II=0;$II<$NC;$II++) {
+	    $a_now_single[$II]= async {     my $pdl_rnd=grandom($n_mod*9*$n_mc);
+					    my $pdl_rnd_lin=random($n_mod*9*$n_mc);
+					    fit_elines_rnd_single($pdl_wave,$pdl_flux,$pdl_e_flux,$n_mod,$chi_goal,$d_chi_goal,\@type,\@a_out,\@ia,\@a0,\@a1,\@link,$n_mc,$pdl_masked,$def,$scale_ini,$pdl_rnd,$pdl_rnd_lin,$ii);
+	    }
+	}
+	
+
+	for ($II=0;$II<$NC;$II++) {
+	    my $junk = $a_now_single[$II]->join();
+	    @a_now=@$junk;
+	    $chi_sq=$a_now[$n_mod][0];
+#	    print "$ii,$II $chi_sq\n";
+	    if ($chi_sq<$chi_sq_ini) {
+		@a_out=copy_a($n_mod,\@a_now);
+		$chi_sq_ini=$chi_sq;
+		$pdl_model=$pdl_model_0;
+		$pdl_model_cont=$pdl_model_cont_0;
+	    } else {
+		if ((abs($chi_sq-$chi_sq_ini)<$d_chi_sq_goal)||($chi_sq_ini<$chi_sq_goal)) {
+		    $ii=$n_mc;
+		}
+	    }
+	    
+	}
+	$ii=$ii+$NC;
+	$chi_sq_now=$chi_sq_ini;
+    }
+    return @a_out;
+}
+
+
+
+sub fit_elines_rnd_single() {
+    my $pdl_wave=$_[0];
+    my $pdl_flux=$_[1];
+    my $pdl_e_flux=$_[2];
+    my $n_mod=$_[3];
+    my $chi_goal=$_[4];
+    my $d_chi_goal=$_[5];
+    my $junk=$_[6];
+    my @type=@$junk;
+    my $junk=$_[7];
+    my @a=@$junk;
+    my $junk=$_[8];
+    my @ia=@$junk;
+    my $junk=$_[9];
+    my @a0=@$junk;
+    my $junk=$_[10];
+    my @a1=@$junk;
+    my $junk=$_[11];
+    my @link=@$junk;
+    my $n_rnd=$_[12];
+    my $pdl_masked=$_[13];
+    my $def=$_[14];
+    my $SCALE_INI=$_[15];
+    my @a_out;    
+    my $SCALE=$SCALE_INI;
+    my $pdl_rnd=$_[16];
+    my $pdl_rnd_lin=$_[17];
+    my $ii=$_[18];
+    my @dims=$pdl_flux->dims;
+    if ($#dims==0) {
+	$nx=$dims[0];
+	$ny=1;
+    }
+
+    if ($#dims==1) {
+	$nx=$dims[0];
+	$ny=$dims[1];
+    }
+
+    my $i;
+
+
+    # First Guess
+    my $n_points=sum($pdl_masked);
+    my $pdl_model_0=zeroes($nx);
+    my $pdl_model_cont_0=zeroes($nx);
+    for ($i=0;$i<$n_mod;$i++) {
+	my $pdl_tmp=create_single_model($pdl_wave,$i,\@type,\@a);
+	$pdl_model_0=$pdl_model_0+$pdl_tmp;
+    }
+    $pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a);
+    my $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+    my $chi_sq=sum($pdl_chi_now);
+    $chi_sq=($chi_sq/($n_points-$n_mod-1))**0.5;
+    $chi_sq_ini=$chi_sq;
+    @a_out=copy_a($n_mod,\@a);
+
+
+    my $i,$j,$ii;
+    my @a_now;
+
+
+    # We start the fitting loop!
+
+    my $pdl_chi_now;
+    my $chi_sq;
+    my $II;
+    my @childs;
+    my $pid;
+
+
+#    print_a_final($n_mod,\@a_out,\@type,$chi_sq_now);
+
+    
+	# We change slighly the parameters
+    #
+    for ($i=0;$i<$n_mod;$i++) {
+	for ($j=0;$j<9;$j++) {
+	    $rnd=$pdl_rnd->at(($j+(9*$i))*$ii);
+	    $rnd_lin=$pdl_rnd_lin->at(($j+(9*$i))*$ii);
+	    if ($ia[$i][$j]==1) {
+		if ($link[$i][$j]==-1) {
+		    if ($j==3) {
+			$a_now[$i][$j]=$a_out[$i][$j]+$SCALE*$rnd*($a1[$i][$j]-$a0[$i][$j])/5;
+		    } else {
+			$a_now[$i][$j]=$a_out[$i][$j]+$SCALE*$a_out[$i][$j]*$rnd;
+		    }
+		    if ($a_now[$i][$j]<$a0[$i][$j]) {
+			$a_now[$i][$j]=$a0[$i][$j];
+		    }
+		    if ($a_now[$i][$j]>$a1[$i][$j]) {
+			$a_now[$i][$j]=$a1[$i][$j];
+		    }
+		} else {
+		    $k=$link[$i][$j]-1;
+		    $method=$a1[$i][$j];
+		    if ($method==0) {
+			$a_now[$i][$j]=$a_now[$k][$j]+$a0[$i][$j];
+		    } else {
+			$a_now[$i][$j]=$a_now[$k][$j]*$a0[$i][$j];
+		    }			    
+		}
+	    } else {
+		$a_now[$i][$j]=$a_out[$i][$j];
+	    }	    
+#	    print "$i,$j $a_now[$i][$j]\n";
+	}
+    }
+    
+    # MC test
+    $pdl_model_0=zeroes($nx);
+    $pdl_model_cont_0=zeroes($nx);
+    for ($i=0;$i<$n_mod;$i++) {
+	my $pdl_tmp=create_single_model($pdl_wave,$i,\@type,\@a_now);
+	$pdl_model_0=$pdl_model_0+$pdl_tmp;
+    }
+    $pdl_model_cont_0=create_single_model($pdl_wave,($n_mod-1),\@type,\@a_now);
+    $pdl_chi_now=$pdl_masked*(($pdl_flux-$pdl_model_0)**2)/($pdl_e_flux**2);
+    $chi_sq=sum($pdl_chi_now);
+    $chi_sq=($chi_sq/($n_points-$n_mod-1))**0.5;
+    $chi_single=$chi_sq;
+    $a_now[$n_mod][0]=$chi_sq;
+#    print "@a_now\n";
+    #$chi_sq_now=$chi_sq;
+    #print "$chi_sq_now\n";
+
+    return \@a_now;
+}
+
+sub plot_test {
+    open(OUT,">out_mod_res.fit_spectra");
+    my $i;
+    for ($i=0;$i<$n;$i++) {
+	my $w=$pdl_wave->at($i);
+	my $f=$pdl_flux->at($i);
+	my $f_mod=$pdl_model->at($i)*($pdl_masked->at($i));
+	my $f_res=$f-$f_mod;
+	my $f_cont=$pdl_model_cont->at($i);
+	print OUT "$w $f $f_mod $f_red $f_cont\n";
+    }
+    close(OUT);
+    if ($plot==1) {
+	$call="plot_out_fit_mod.pl out_mod_res.fit_spectra 1/xs &";
+	system($call);
+    }
+}
+
+
+sub create_single_model() {
+    my $pdl_wave=$_[0];
+    my $i_now=$_[1];
+    my $junk=$_[2];
+    my @type=@$junk;
+    my $junk=$_[3];
+    my @a_c=@$junk;
+
+    my @dims=$pdl_wave->dims();
+    my $nx=$dims[0];
+    my $i=0;
+    my $pdl_out=zeroes($nx);
+    my $j=0;
+
+    for ($i=0;$i<$nx;$i++) {
+	my $w=$pdl_wave->at($i);
+	if ($type[$i_now] eq "eline") {
+	    my $speed_of_light=299792.458;
+	    my $factor=(1+$a_c[$i_now][3]/$speed_of_light+$a_c[$i_now][5]);
+	    my $e1=1;
+	    my $Y1=1;
+	    if ($a_c[$i_now][2]!=0) {
+		$e1=exp(-0.5*(($w-$a_c[$i_now][0]*$factor)/$a_c[$i_now][2])**2);
+		$Y1=$a_c[$i_now][1]*$e1/($a_c[$i_now][2]*((2*3.1416)**0.5));
+	    }
+	    set($pdl_out,$i,$Y1);
+	}
+	if ($type[$i_now] eq "poly1d") {
+	    my $ii;
+	    my $Yi=0;
+	    for ($ii=0;$ii<9;$ii++) {
+		$Yi=$Yi+$a_c[$i_now][$ii]*($w)**($ii);
+	    }
+#	    print "$Yi\n";
+	    set($pdl_out,$i,$Yi);
+	}
+    }
+    return $pdl_out;
+}
+
+sub print_a_val() {
+    my $n_mod=$_[0];
+    my $junk=$_[1];
+    my @a_print=@$junk;
+    my $junk=$_[2];
+    my @e_a_print=@$junk;
+    my $junk=$_[3];
+    my @type=@$junk;
+    my $chi_a=$_[4];
+    my $ii,$j;
+    print "$n_mod $chi_a\n";
+    for ($ii=0;$ii<$n_mod;$ii++) {   
+	print "$type[$ii] ";
+	for ($j=0;$j<9;$j++) {
+	    print "$a_print[$ii][$j] $e_a_print[$ii][$j] ";
+	}
+	print "\n";
+    }
+}
+
+
+sub print_a_final() {
+    my $n_mod=$_[0];
+    my $junk=$_[1];
+    my @a_print=@$junk;
+    my $junk=$_[2];
+    my @type=@$junk;
+    my $chi_a=$_[3];
+    my $ii,$j;
+    print "$n_mod $chi_a\n";
+    for ($ii=0;$ii<$n_mod;$ii++) {   
+	print "$type[$ii] ";
+	for ($j=0;$j<9;$j++) {
+	    print "$a_print[0][$ii][$j] $a_print[1][$ii][$j] ";
+	}
+	print "\n";
+    }
+}
+
+sub print_a_final_file() {
+    my $n_mod=$_[0];
+    my $junk=$_[1];
+    my @a_print=@$junk;
+    my $junk=$_[2];
+    my @type=@$junk;
+    my $chi_a=$_[3];
+    my $outfile=$_[4];
+    my $ii,$j;
+    print "OUT_FILE = $outfile\n";
+    open(OUT,">$outfile");
+    print OUT "$n_mod $chi_a\n";
+    for ($ii=0;$ii<$n_mod;$ii++) {   
+	print OUT "$type[$ii] ";
+	for ($j=0;$j<9;$j++) {
+	    print OUT "$a_print[0][$ii][$j] $a_print[1][$ii][$j] ";
+	}
+	print OUT "\n";
+    }
+    close(OUT);
+}
+
+
+#print_config_file($n_mod,$chi_sq_goal,$d_chi_sq_goal,\@a_final,\@type,\@ia,\@a0,\@a1,\@link,$out_config);
+
+sub print_config_file() {
+    my $n_mod=$_[0];
+    my $chi_sq_goal=$_[1];
+    my $d_chi_sq_goal=$_[2];
+    my $junk=$_[3];
+    my @a_print=@$junk;
+    my $junk=$_[4];
+    my @type=@$junk;
+    my $junk=$_[5];
+    my @ia=@$junk;
+    my $junk=$_[6];
+    my @a0=@$junk;
+    my $junk=$_[7];
+    my @a1=@$junk;
+    my $junk=$_[8];
+    my @link=@$junk;
+    my $outfile=$_[9];
+    my $ii,$j;
+    print "OUT_CONFIG = $outfile\n";
+    open(OUT,">$outfile");
+    print OUT "0 $n_mod $chi_sq_goal $d_chi_sq_goal\n";
+    for ($ii=0;$ii<$n_mod;$ii++) {   
+	print OUT "$type[$ii]\n";
+	for ($j=0;$j<9;$j++) {
+	    print OUT "$a_print[0][$ii][$j] $ia[$ii][$j] $a0[$ii][$j] $a1[$ii][$j] $link[$ii][$jj]\n";
+	}
+    }
+    close(OUT);
+}
+
+
+sub copy_a() {
+    my $n_mod=$_[0];
+    my $junk=$_[1];
+    my @a_print=@$junk;
+    my @a_copy;
+    my $ii,$j;
+    for ($ii=0;$ii<$n_mod;$ii++) {   
+	for ($j=0;$j<9;$j++) {
+	    $a_copy[$ii][$j]=$a_print[$ii][$j];
+	}
+    }
+    return @a_copy;
+}
+
+sub random_a() {
+    my $n_mod=$_[0];
+    my $r_scale=$_[1];
+    my $junk=$_[2];
+    my @a_print=@$junk;
+    my @a_copy;
+    my $ii,$j;
+    for ($ii=0;$ii<$n_mod;$ii++) {
+	my $pdl_rnd=grandom(10);
+	for ($j=0;$j<9;$j++) {	    
+		my $rnd=$pdl_rnd->at($j); 
+		if (($j!=3)&&($link[$ii][$j]==-1)) {		
+		    $a_copy[$ii][$j]=$a_print[$ii][$j]+$r_scale*$rnd*$a_print[$ii][$j];
+		} else {
+		    $a_copy[$ii][$j]=$a_print[$ii][$j];
+		}
+	    
+	}
+    }
+    return @a_copy;
+}
+
+
+sub copy_a_results() {
+    my $n_mod=$_[0];
+    my $kk=$_[1];
+    my $junk=$_[2];
+    my @a_print=@$junk;
+    my $junk=$_[3];
+    my @a_copy=@$junk;
+    my $ii,$j;
+    for ($ii=0;$ii<$n_mod;$ii++) {   
+	for ($j=0;$j<9;$j++) {
+	    $a_copy[$kk][$ii][$j]=$a_print[$ii][$j];
+	}
+    }
+    return @a_copy;
+}
+
+sub mean_a_results() {
+    my $n_mod=$_[0];
+    my $nk=$_[1];
+    my $junk=$_[2];
+    my @a_print=@$junk;
+    my @a_copy;
+    my $ii,$j,$k;
+    for ($ii=0;$ii<$n_mod;$ii++) {   
+	for ($j=0;$j<9;$j++) {
+	    my @a_tmp;
+	    for ($k=0;$k<$nk;$k++) { 
+		$a_tmp[$k]=$a_print[$k][$ii][$j];
+	    }
+	    my $val=mean(@a_tmp);
+	    my $e_val=sigma(@a_tmp);
+	    $a_copy[0][$ii][$j]=$val;
+	    $a_copy[1][$ii][$j]=$e_val*$ia[$ii][$j];
+	}
+    }
+    return @a_copy;
+}
+
+
+sub plot_results {
+    my $plot=$_[0];
+    my $pdl_wave=$_[1];
+    my $pdl_output=$_[2];
+    my $output_name=$_[3];
+    my $title=$_[4];
+    my $min_wave,$max_wave;
+    my $dev_plot;
+    my $y_min,$y_max;
+    my @stats;
+    my $nx,$ny;
+    my @wave_now=list($pdl_wave);
+    my $i,$j;
+
+    if ($plot>0) {
+	$dev_plot="/null";
+	if ($plot==1) {
+	    $dev_plot="/xs";
+	} else {
+	    if ($plot==3) {
+		$dev_plot=$output_name.".png/PNG";
+	    } else {
+		$dev_plot=$output_name.".ps/CPS";
+	    }
+	}
+	@stats=stats($pdl_output->slice(":,(0)"));
+	$y_min=-0.5*$stats[0]-0.75*$stats[1];
+	$y_max=2*$stats[0]+6*$stats[1];
+	($nx,$ny)=$pdl_output->dims();
+	$min_wave=$wave_now[0];
+	$max_wave=$wave_now[$nx-2];
+
+	pgbegin(0,$dev_plot,1,1);
+	pgsfs(1.2);
+	pgscf(2);             # Set character font
+	pgslw(2);             # Set line width
+	pgsch(1.2);           # Set character height
+	pgenv($min_wave,$max_wave,$y_min,$y_max,0,0);
+	pgsch(0.9);           # Set character height
+	pglabel("Wavelength","Flux","$title");
+	pgsch(0.5);
+	for ($j=0;$j<$ny;$j++) {
+	    my $t=$pdl_output->slice(":,($j)");
+	    pgsci(1+$j);
+	    my @flux=list($t);
+	    pgline($nx,\@wave_now,\@flux);
+	}
+	pgsci(1);
+	pgclose;
+	pgend;
+    }
+}
+
+sub print_out_results {
+    my $pdl_wave=$_[0];
+    my $pdl_output=$_[1];
+    my $output_name=$_[2];
+    my $min_wave,$max_wave;
+    my $dev_plot;
+    my $y_min,$y_max;
+    my @stats;
+    my $nx,$ny;
+    my @wave_now=list($pdl_wave);
+    my $i,$j;
+    ($nx,$ny)=$pdl_output->dims();
+    $min_wave=$wave_now[0];
+    $max_wave=$wave_now[$nx-2];
+    open(OUT,">$output_name");
+    for ($i=0;$i<$nx-1;$i++){
+	my $t=$pdl_output->slice("($i),:");
+	my @flux=list($t);
+	print OUT "$i $wave_now[$i] @flux\n";
+    }
+    close(OUT);
+}
+
+
+
+
+sub create_single_model_one() {
+    my $pdl_wave=$_[0];
+    my $i_now=$_[1];
+    my $junk=$_[2];
+    my @type=@$junk;
+    my $junk=$_[3];
+    my @a_c=@$junk;
+
+    my @dims=$pdl_wave->dims();
+    my $nx=$dims[0];
+    my $i=0;
+    my $pdl_out=zeroes($nx);
+    my $j=0;
+
+    for ($i=0;$i<$nx;$i++) {
+	my $w=$pdl_wave->at($i);
+	if ($type[$i_now] eq "eline") {
+	    my $speed_of_light=299792.458;
+	    my $factor=(1+$a_c[$i_now][3]/$speed_of_light+$a_c[$i_now][5]);
+	    my $e1=1;
+	    my $Y1=1;
+	    if ($a_c[$i_now][2]!=0) {
+		$e1=exp(-0.5*(($w-$a_c[$i_now][0]*$factor)/$a_c[$i_now][2])**2);
+#		$Y1=$a_c[$i_now][1]*$e1/($a_c[$i_now][2]*((2*3.1416)**0.5));
+		$Y1=1.0*$e1/($a_c[$i_now][2]*((2*3.1416)**0.5));
+	    }
+	    set($pdl_out,$i,$Y1);
+	}
+	if ($type[$i_now] eq "poly1d") {
+	    my $ii;
+	    my $Yi=0;
+	    for ($ii=0;$ii<9;$ii++) {
+		$Yi=$Yi+$a_c[$i_now][$ii]*($w)**($ii);
+	    }
+	    set($pdl_out,$i,$Yi);
+	}
+    }
+    return $pdl_out;
+}
+
+sub create_single_model_poly() {
+    my $pdl_wave=$_[0];
+    my $ii=$_[1];
+    my @dims=$pdl_wave->dims();
+    my $nx=$dims[0];
+    my $i=0;
+    my $pdl_out=zeroes($nx);
+    my $j=0;
+    for ($i=0;$i<$nx;$i++) {
+	my $w=$pdl_wave->at($i);
+	my $Yi=($w)**($ii);
+	set($pdl_out,$i,$Yi);
+    }
+    return $pdl_out;
+}
+
+sub get_seconds {
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+    my $sec_now=$hour*3600+$min*60+$sec;
+    return $sec_now;
+}

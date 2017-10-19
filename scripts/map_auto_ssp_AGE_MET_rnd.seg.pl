@@ -1,0 +1,1 @@
+/home/sanchez/sda2/code/lyon/fitting_tool/user/bin/map_auto_ssp_AGE_MET_rnd.seg.pl

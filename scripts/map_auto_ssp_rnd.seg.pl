@@ -1,0 +1,1 @@
+/home/sanchez/sda2/code/lyon/fitting_tool/user/bin/map_auto_ssp_rnd.seg.pl
